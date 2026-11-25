@@ -1,0 +1,93 @@
+name: ChampSim baseline
+on:
+  push:
+    paths: ['.github/workflows/champsim.yml']
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [smoke, full]
+        default: smoke
+      champsim_commit:
+        description: Optional upstream ChampSim commit SHA
+        type: string
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      MODE: ${{ inputs.mode || 'smoke' }}
+      CHAMPSIM_COMMIT: ${{ inputs.champsim_commit }}
+    steps:
+      - name: Build official DPC-4 baseline
+        shell: bash
+        run: |
+          mkdir evidence
+          git clone https://github.com/CMU-SAFARI/ChampSim.git
+          git ls-remote https://github.com/CMU-SAFARI/DPC4.git HEAD > evidence/dpc4-commit.txt
+          cd ChampSim
+          if [[ -n "$CHAMPSIM_COMMIT" ]]; then
+            [[ "$CHAMPSIM_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            git checkout --detach "$CHAMPSIM_COMMIT"
+          fi
+          git rev-parse HEAD | tee ../evidence/champsim-commit.txt
+          git submodule update --init --recursive
+          vcpkg/bootstrap-vcpkg.sh
+          vcpkg/vcpkg install
+          ./config.sh dpc4/1C.fullBW.baseline.json
+          make -j2
+      - name: Download one public DPC-4 trace
+        shell: bash
+        run: |
+          trace=603.bwaves_s-5359B.champsimtrace.xz
+          curl --fail --location --retry 3 --max-time 600 --output "$trace" "https://traces.rbera.com/dpc4/SPEC17/$trace"
+          test "$(stat -c %s "$trace")" -eq 32233972
+          df -B1 . | tee evidence/disk-before.txt
+      - name: Simulate and measure
+        shell: bash
+        run: |
+          instructions=1000000
+          warmup=100000
+          if [[ "$MODE" == full ]]; then
+            instructions=250000000
+            warmup=0
+          fi
+          echo "$instructions" > evidence/requested-instructions.txt
+          /usr/bin/time -v -o evidence/resources.txt ChampSim/bin/1C.fullBW.baseline --hide-heartbeat --warmup-instructions "$warmup" --simulation-instructions "$instructions" 603.bwaves_s-5359B.champsimtrace.xz > evidence/champsim.log 2>&1
+          tail -100 evidence/champsim.log
+          df -B1 . | tee evidence/disk-after.txt
+      - name: Validate metrics and write CSV
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import math
+          import re
+          from pathlib import Path
+
+          directory = Path('evidence')
+          log = (directory / 'champsim.log').read_text()
+          summary = log.split('Region of Interest Statistics')[-1]
+          cpu = re.findall(r'CPU\s+0\s+cumulative IPC:\s*(\S+)\s+instructions:\s*(\d+)\s+cycles:\s*(\d+)', summary, re.I)
+          llc = re.findall(r'^\s*(?:cpu0_)?LLC\s+TOTAL\s+ACCESS:\s*\d+\s+HIT:\s*\d+\s+MISS:\s*(\d+)', summary, re.I | re.M)
+          if len(cpu) != 1 or len(llc) != 1:
+              raise SystemExit(f'Expected one ROI CPU summary and one LLC total, found {len(cpu)} and {len(llc)}')
+          _, instructions, cycles = map(float, cpu[0])
+          requested = int((directory / 'requested-instructions.txt').read_text())
+          if instructions < requested or not math.isfinite(cycles) or cycles <= 0:
+              raise SystemExit('Simulation did not produce valid counters for the requested window')
+          with (directory / 'result.csv').open('w', newline='') as file:
+              writer = csv.writer(file)
+              writer.writerow(['trace_id', 'suite', 'config', 'ipc', 'llc_mpki', 'instructions'])
+              writer.writerow(['603.bwaves_s-5359B', 'spec17', 'berti_pythia', instructions / cycles, 1000 * int(llc[0]) / instructions, int(instructions)])
+          print((directory / 'result.csv').read_text())
+          PY
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: champsim-evidence
+          path: evidence/
+          retention-days: 7

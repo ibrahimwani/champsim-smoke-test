@@ -71,7 +71,7 @@ jobs:
           log = (directory / 'champsim.log').read_text()
           summary = log.split('Region of Interest Statistics')[-1]
           cpu = re.findall(r'CPU\s+0\s+cumulative IPC:\s*(\S+)\s+instructions:\s*(\d+)\s+cycles:\s*(\d+)', summary, re.I)
-          llc = re.findall(r'^\s*(?:cpu0_)?LLC\s+TOTAL\s+ACCESS:\s*\d+\s+HIT:\s*\d+\s+MISS:\s*(\d+)', summary, re.I | re.M)
+          llc = re.findall(r'^\s*(?:cpu0->)?(?:cpu0_)?LLC\s+TOTAL\s+ACCESS:\s*\d+\s+HIT:\s*\d+\s+MISS:\s*(\d+)', summary, re.I | re.M)
           if len(cpu) != 1 or len(llc) != 1:
               raise SystemExit(f'Expected one ROI CPU summary and one LLC total, found {len(cpu)} and {len(llc)}')
           _, instructions, cycles = map(float, cpu[0])
@@ -84,6 +84,13 @@ jobs:
               writer.writerow(['603.bwaves_s-5359B', 'spec17', 'berti_pythia', instructions / cycles, 1000 * int(llc[0]) / instructions, int(instructions)])
           print((directory / 'result.csv').read_text())
           PY
+          {
+            printf '### ChampSim %s result\n\n' "$MODE"
+            printf '\x60\x60\x60csv\n'
+            cat evidence/result.csv
+            printf '\x60\x60\x60\n\n'
+            grep -E 'Elapsed \(wall clock\)|Maximum resident set size' evidence/resources.txt
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload run evidence
         if: always()
         uses: actions/upload-artifact@v4
